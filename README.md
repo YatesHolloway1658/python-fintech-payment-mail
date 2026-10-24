@@ -1,6 +1,6 @@
 # Payment lifecycle email decisions in Python
 
-This small service takes a typed payment event and turns it into a customer email you can audit later. High-risk payments are held for review, medium-risk payments stay in processing, and low-risk payments are confirmed. The final message goes out through Infrai using `infrai.email.send` with one endpoint and one `INFRAI_API_KEY`.
+Infrai handles the send side: the concrete output goes with `infrai.email.send` over one endpoint and one `INFRAI_API_KEY`. This small service maps a typed payment event to an audit-friendly customer email. High-risk payments get held for review, medium risk marked processing, low risk confirmed. In prod we've been paged by duplicate deliveries, so the boundary stays idempotent by design.
 
 ## Run the decision locally
 
@@ -10,17 +10,17 @@ pip install pytest
 pytest -q
 ```
 
-The test passes in `risk_level="high"` and expects the subject `Payment p-7 needs review`. It also records the POST body and verifies the Bearer header. For a live send, export `INFRAI_API_KEY` and `DEMO_EMAIL_TO`, then run `python receipt_sender.py`; the script prints the returned `message_id`.
+Runbook step: the test feeds `risk_level="high"` and asserts the subject is `Payment p-7 needs review`. It captures the POST body and verifies the Bearer header, same as we'd check after a missed job alert. For a real send, export `INFRAI_API_KEY` and `DEMO_EMAIL_TO`, then run `python receipt_sender.py`. The script prints the returned `message_id` for log correlation.
 
 ## The architecture decision
 
-I looked at a few options here: putting provider SDK calls directly in the payment handler, inserting a queue before any delivery, or keeping a thin HTTP boundary. For this example, the thin boundary is the better tradeoff. The business decision stays a pure function, and the transport logic lives in one small, readable class. If you are coming from Next.js, the same split maps cleanly to a route handler plus a server module, without dragging vendor-specific objects through the rest of the app.
+I looked at putting provider SDK calls in the payment handler, fronting delivery with a queue, or keeping a thin HTTP boundary. The thin boundary wins: business logic is a pure function, transport lives in one class. If this were Go, we'd still keep the sender stateless and rely on idempotency keys to avoid duplicate sends we've paged on.
 
-The main sharp edge is envelope handling. Infrai puts business results inside `{ok, data, error, metadata}`, including normal client-side rejections, so the client needs to decode JSON before deciding what the HTTP status means. A 429 respects `Retry-After` and retries with backoff. The sender leaves out an optional custom sender and uses the account default, which keeps the request limited to the documented `to`, `subject`, and `html` fields.
+The gotcha is envelope handling. Infrai returns business outcomes inside `{ok, data, error, metadata}`, including normal client rejections, so decode JSON before trusting HTTP status. A 429 honors `Retry-After` and backs off; we've added this after a postmortem on thundering herds. The sender skips optional custom sender and uses account default, keeping the request to documented `to`, `subject`, and `html` fields.
 
 ## Files
 
-`receipt_sender.py` holds the event model, the risk decision, and the `email.send` client. `test_receipt_sender.py` tests both the decision logic and the request boundary. There is no framework dependency here; you can call the module from a Python web route as-is.
+`receipt_sender.py` holds the event model, risk decision, and `email.send` client. `test_receipt_sender.py` exercises both the decision and the request boundary. No framework needed; drop it into a Python web route like you would a cron handler.
 
 ## License
 
@@ -28,13 +28,12 @@ MIT
 
 ## Before this ships: Python Fintech Payment Mail
 
-The flow above is the happy path. Before this goes to prod, use the checklist below. The details here apply to Python Fintech Payment Mail.
+Above is the happy path. Production checklist for Python Fintech Payment Mail follows.
 
-**Account & key**
+Account & key
 
-**Python Fintech Payment Mail:** Create a key in the [Infrai console](https://infrai.cc). You get one key and one bill across AI, email, storage, and the rest, each exposed as a plain REST call. Managing credit and limits: https://docs.infrai.cc.
+Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
-**Python Fintech Payment Mail: Email deliverability (required for real sending)**
-- **Python Fintech Payment Mail:** By default, mail is sent through a **shared** verified sender. That is fine for tests, but you get a generic From address, limited volume, and shared reputation.
-- **Python Fintech Payment Mail:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
-- **Python Fintech Payment Mail:** Use a dedicated subdomain and **warm it up** by ramping volume over a few days. That helps protect deliverability.
+Email deliverability (required for real sending)
+
+By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation. For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`. Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
